@@ -9,6 +9,7 @@ type ExecReportResponse = {
   reportResult?: { tables?: Array<{ header?: string[]; rows?: number }> };
 };
 type ResultRow = { c?: Array<{ t?: string } | string> };
+type ReportTableMeta = { header?: string[]; rows?: number };
 
 function normName(s: string) {
   return String(s ?? "")
@@ -54,6 +55,48 @@ function convertTimestampColumnsToEat<T extends Record<string, unknown>>(
     }
     return out as T;
   });
+}
+
+function parseDdMmYyyyHhMmSsEatToEpochMs(val: string) {
+  const m = /^(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2}):(\d{2})$/.exec(val.trim());
+  if (!m) return Number.NaN;
+  const [, dd, mm, yyyy, HH, MM, SS] = m;
+  // Interpret the string as EAT (UTC+3) then convert to UTC epoch ms by subtracting 3h.
+  const utcMs = Date.UTC(
+    Number(yyyy),
+    Number(mm) - 1,
+    Number(dd),
+    Number(HH) - 3,
+    Number(MM),
+    Number(SS),
+  );
+  return utcMs;
+}
+
+function formatDurationFromMs(ms: number) {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const totalSeconds = Math.floor(ms / 1000);
+  const days = Math.floor(totalSeconds / 86400);
+  const rem = totalSeconds % 86400;
+  const h = Math.floor(rem / 3600);
+  const m = Math.floor((rem % 3600) / 60);
+  const s = rem % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const hhmmss = `${h}:${pad(m)}:${pad(s)}`;
+  return days > 0 ? `${days} days ${hhmmss}` : hhmmss;
+}
+
+function formatNowForFilenameEat() {
+  // Format: YYYY-MM-DD_HH-mm-ss in EAT (UTC+3)
+  const d = new Date(Date.now() + 3 * 60 * 60 * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const yyyy = d.getUTCFullYear();
+  const mm = pad(d.getUTCMonth() + 1);
+  const dd = pad(d.getUTCDate());
+  const HH = pad(d.getUTCHours());
+  const MM = pad(d.getUTCMinutes());
+  const SS = pad(d.getUTCSeconds());
+  return `${yyyy}-${mm}-${dd}_${HH}-${MM}-${SS}`;
 }
 
 async function wialonLogin(token: string) {
@@ -105,7 +148,7 @@ async function wialonGetResultSubrows(eid: string, tableIndex: number, rowIndex:
   return (await res.json()) as ResultRow[];
 }
 
-async function fetchTableAsObjects(eid: string, tables: ExecReportResponse["reportResult"]["tables"], tableIndex: number) {
+async function fetchTableAsObjects(eid: string, tables: ReportTableMeta[] | undefined, tableIndex: number) {
   const meta = tables?.[tableIndex];
   const headers = meta?.header ?? [];
   const rowCount = meta?.rows ?? 0;
@@ -226,46 +269,82 @@ export async function POST(req: Request) {
 
     const REPORT_RESOURCE_ID = 25601229;
     const TEMPLATE_26 = 26;
+    const TEMPLATE_29 = 29; // notebook uses this for detailization table 0
 
-    const locRows: Array<Record<string, string | number>> = [];
-    const mileageRows: Array<Record<string, string | number>> = [];
-    const geofenceRows: Array<Record<string, string | number>> = [];
+    const locByUnit = new Map<number, Record<string, string>>();
+    const mileageByUnit = new Map<number, Record<string, string>>();
+
+    // Yard geofence (from template 26, table 2 detailization)
+    const yardCandidates: Array<Record<string, string | number>> = [];
+
+    // Main detailization rows used to build the first columns of new_df (from template 29, table 0 detailization)
+    const detailCandidates: Array<Record<string, string | number>> = [];
 
     for (const { unitId, name } of unique) {
-      const exec = await wialonExecReport(eid, REPORT_RESOURCE_ID, TEMPLATE_26, unitId, fromTs, toTs);
-      const tables = exec.reportResult?.tables ?? [];
+      // ---- Template 26: location + mileage + yard geofence detailization (table 2)
+      const exec26 = await wialonExecReport(eid, REPORT_RESOURCE_ID, TEMPLATE_26, unitId, fromTs, toTs);
+      const tables26 = exec26.reportResult?.tables ?? [];
 
-      const loc = await fetchTableAsObjects(eid, tables, 0);
-      for (const r of loc) locRows.push({ ...r, unit_id: unitId, Grouping: r["Grouping"] ?? name });
+      const loc = await fetchTableAsObjects(eid, tables26, 0);
+      const loc0 = loc[0] ?? {};
+      const grouping = String(loc0["Grouping"] ?? name);
+      locByUnit.set(unitId, {
+        Grouping: grouping,
+        Location: String(loc0["Location"] ?? ""),
+        // Always convert to EAT (UTC+3) like the notebook
+        "Last message time": parseWialonUtcToEatString(String(loc0["Last message time"] ?? "")),
+      });
 
-      const mileage = await fetchTableAsObjects(eid, tables, 1);
-      for (const r of mileage) mileageRows.push({ ...r, unit_id: unitId, Grouping: r["Grouping"] ?? name });
+      const mileage = await fetchTableAsObjects(eid, tables26, 1);
+      const mileage0 = mileage[0] ?? {};
+      mileageByUnit.set(unitId, {
+        Grouping: String(mileage0["Grouping"] ?? grouping),
+        "Mileage in trips": String(mileage0["Mileage in trips"] ?? ""),
+      });
 
-      const parentGeo = await fetchTableAsObjects(eid, tables, 2);
-      if (parentGeo.length) {
-        for (let rowIndex = 0; rowIndex < parentGeo.length; rowIndex++) {
-          const sub = await wialonGetResultSubrows(eid, 2, rowIndex);
-          for (const row of sub ?? []) {
-            const cells = row?.c ?? [];
-            const values = cells.map((c) => (typeof c === "string" ? c : c?.t ?? ""));
-            // Expected order in notebook: [Grouping, Geofence, Time in, Time out, Duration in]
-            geofenceRows.push({
-              Grouping: String(values[0] ?? name),
-              Geofence: String(values[1] ?? ""),
-              "Time in": String(values[2] ?? ""),
-              "Time out": String(values[3] ?? ""),
-              "Duration in": String(values[4] ?? ""),
-              unit_id: unitId,
-            });
-          }
+      const parentGeo = await fetchTableAsObjects(eid, tables26, 2);
+      for (let rowIndex = 0; rowIndex < parentGeo.length; rowIndex++) {
+        const sub = await wialonGetResultSubrows(eid, 2, rowIndex);
+        for (const row of sub ?? []) {
+          const cells = row?.c ?? [];
+          const values = cells.map((c) => (typeof c === "string" ? c : c?.t ?? ""));
+          yardCandidates.push({
+            Grouping: String(values[0] ?? grouping),
+            Geofence: String(values[1] ?? ""),
+            "Time in": String(values[2] ?? ""),
+            "Time out": String(values[3] ?? ""),
+            "Duration in": String(values[4] ?? ""),
+            unit_id: unitId,
+          });
+        }
+      }
+
+      // ---- Template 29: detailization (table 0 subrows) used as the base of new_df
+      const exec29 = await wialonExecReport(eid, REPORT_RESOURCE_ID, TEMPLATE_29, unitId, fromTs, toTs);
+      const tables29 = exec29.reportResult?.tables ?? [];
+      const parent29 = await fetchTableAsObjects(eid, tables29, 0);
+      for (let rowIndex = 0; rowIndex < parent29.length; rowIndex++) {
+        const sub = await wialonGetResultSubrows(eid, 0, rowIndex);
+        for (const row of sub ?? []) {
+          const cells = row?.c ?? [];
+          const values = cells.map((c) => (typeof c === "string" ? c : c?.t ?? ""));
+          // Notebook expects: [Grouping, Geofence, Time in, Time out, Duration in]
+          detailCandidates.push({
+            Grouping: String(values[0] ?? grouping),
+            Geofence: String(values[1] ?? ""),
+            "Time in": String(values[2] ?? ""),
+            "Time out": String(values[3] ?? ""),
+            "Duration in": String(values[4] ?? ""),
+            unit_id: unitId,
+          });
         }
       }
     }
 
     // Convert timestamp columns like the notebook.
-    const locOut = convertTimestampColumnsToEat(locRows, ["Last message time", "Last coordinates time"]);
-    const mileageOut = convertTimestampColumnsToEat(mileageRows, []);
-    const geofenceOut = convertTimestampColumnsToEat(geofenceRows, ["Time in", "Time out"]);
+    const mileageOut = Array.from(mileageByUnit.entries()).map(([unit_id, v]) => ({ ...v, unit_id }));
+    const yardOut = convertTimestampColumnsToEat(yardCandidates, ["Time in", "Time out"]);
+    const detailOut = convertTimestampColumnsToEat(detailCandidates, ["Time in", "Time out"]);
 
     // 4HR mileage (now - 4h to now), merged by unit_id.
     // Epoch seconds are timezone-independent. This matches the notebook's:
@@ -283,21 +362,188 @@ export async function POST(req: Request) {
       if (typeof value === "string") mileage4ByUnit.set(unitId, value);
     }
 
-    const mileageFinal = mileageOut.map((r) => ({
-      ...r,
-      "Mileage 4HRs": typeof r.unit_id === "number" ? (mileage4ByUnit.get(r.unit_id) ?? "") : "",
-    }));
+    // ---- Merge duplicated detail rows like the notebook:
+    // group by (unit_id, Geofence, Grouping), Time in=min, Time out=max, Duration in = Time out - Time in
+    const mergedDetailMap = new Map<
+      string,
+      {
+        unit_id: number;
+        Grouping: string;
+        Geofence: string;
+        minIn: string;
+        maxOut: string;
+      }
+    >();
 
-    // Build Excel
+    for (const r of detailOut) {
+      const uid = Number(r.unit_id);
+      if (!Number.isFinite(uid)) continue;
+      const grouping = String(r.Grouping ?? "");
+      const geofence = String(r.Geofence ?? "");
+      const timeIn = String(r["Time in"] ?? "");
+      const timeOut = String(r["Time out"] ?? "");
+      const key = `${uid}::${geofence}::${grouping}`;
+
+      const currInMs = parseDdMmYyyyHhMmSsEatToEpochMs(timeIn);
+      const currOutMs = parseDdMmYyyyHhMmSsEatToEpochMs(timeOut);
+
+      const prev = mergedDetailMap.get(key);
+      if (!prev) {
+        mergedDetailMap.set(key, {
+          unit_id: uid,
+          Grouping: grouping,
+          Geofence: geofence,
+          minIn: timeIn,
+          maxOut: timeOut,
+        });
+        continue;
+      }
+
+      const prevInMs = parseDdMmYyyyHhMmSsEatToEpochMs(prev.minIn);
+      const prevOutMs = parseDdMmYyyyHhMmSsEatToEpochMs(prev.maxOut);
+
+      if (Number.isFinite(currInMs) && (!Number.isFinite(prevInMs) || currInMs < prevInMs)) {
+        prev.minIn = timeIn;
+      }
+      if (Number.isFinite(currOutMs) && (!Number.isFinite(prevOutMs) || currOutMs > prevOutMs)) {
+        prev.maxOut = timeOut;
+      }
+      mergedDetailMap.set(key, prev);
+    }
+
+    const mergedDetailRows = Array.from(mergedDetailMap.values()).map((x) => {
+      const inMs = parseDdMmYyyyHhMmSsEatToEpochMs(x.minIn);
+      const outMs = parseDdMmYyyyHhMmSsEatToEpochMs(x.maxOut);
+      const dur = Number.isFinite(inMs) && Number.isFinite(outMs) ? formatDurationFromMs(outMs - inMs) : "";
+      return {
+        unit_id: x.unit_id,
+        Grouping: x.Grouping,
+        Geofence: x.Geofence,
+        "Time in": x.minIn,
+        "Time out": x.maxOut,
+        "Duration in": dur,
+      };
+    });
+
+    // Pick the earliest Time in per unit for the single Tracking row (matches the notebook's resulting 1 row per vehicle).
+    const detailBestByUnit = new Map<number, Record<string, string>>();
+    for (const r of mergedDetailRows) {
+      const uid = Number(r.unit_id);
+      if (!Number.isFinite(uid)) continue;
+      const timeIn = String(r["Time in"] ?? "");
+      const t = parseDdMmYyyyHhMmSsEatToEpochMs(timeIn);
+      const prev = detailBestByUnit.get(uid);
+      if (!prev) {
+        detailBestByUnit.set(uid, {
+          Grouping: String(r.Grouping ?? ""),
+          Geofence: String(r.Geofence ?? ""),
+          "Time in": timeIn,
+          "Time out": String(r["Time out"] ?? ""),
+          "Duration in": String(r["Duration in"] ?? ""),
+        });
+        continue;
+      }
+      const prevT = parseDdMmYyyyHhMmSsEatToEpochMs(String(prev["Time in"] ?? ""));
+      if (Number.isFinite(t) && (!Number.isFinite(prevT) || t < prevT)) {
+        detailBestByUnit.set(uid, {
+          Grouping: String(r.Grouping ?? ""),
+          Geofence: String(r.Geofence ?? ""),
+          "Time in": timeIn,
+          "Time out": String(r["Time out"] ?? ""),
+          "Duration in": String(r["Duration in"] ?? ""),
+        });
+      }
+    }
+
+    // Yard dedup: keep first per (unit_id, Geofence) by Time in, then pick yard row per unit (first available)
+    const yardBestByUnit = new Map<number, { yardGeofence: string; yardTimeIn: string; status: string }>();
+    const yardSorted = [...yardOut].sort((a, b) => {
+      const ta = parseDdMmYyyyHhMmSsEatToEpochMs(String(a["Time in"] ?? ""));
+      const tb = parseDdMmYyyyHhMmSsEatToEpochMs(String(b["Time in"] ?? ""));
+      if (!Number.isFinite(ta) && !Number.isFinite(tb)) return 0;
+      if (!Number.isFinite(ta)) return 1;
+      if (!Number.isFinite(tb)) return -1;
+      return ta - tb;
+    });
+    const seenUnitGeo = new Set<string>();
+    for (const r of yardSorted) {
+      const uid = Number(r.unit_id);
+      if (!Number.isFinite(uid)) continue;
+      const geofence = String(r.Geofence ?? "");
+      const key = `${uid}::${geofence}`;
+      if (seenUnitGeo.has(key)) continue;
+      seenUnitGeo.add(key);
+
+      if (!yardBestByUnit.has(uid)) {
+        const timeIn = String(r["Time in"] ?? "");
+        const status =
+          !timeIn || timeIn === "----" || timeIn === "-----" || timeIn === "None" ? "Incomplete" : "Completed";
+        yardBestByUnit.set(uid, {
+          yardGeofence: geofence,
+          yardTimeIn: timeIn,
+          status,
+        });
+      }
+    }
+
+    const trackingRows: Array<Record<string, string>> = [];
+    for (const { unitId } of unique) {
+      const detail = detailBestByUnit.get(unitId) ?? {
+        Grouping: locByUnit.get(unitId)?.Grouping ?? "",
+        Geofence: "",
+        "Time in": "",
+        "Time out": "",
+        "Duration in": "",
+      };
+      const loc = locByUnit.get(unitId) ?? { Grouping: detail.Grouping ?? "", Location: "", "Last message time": "" };
+      const mileage = mileageByUnit.get(unitId) ?? { "Mileage in trips": "" };
+      const yard = yardBestByUnit.get(unitId);
+
+      trackingRows.push({
+        Grouping: String(detail.Grouping ?? loc.Grouping ?? ""),
+        Geofence: String(detail.Geofence ?? ""),
+        "Time in": String(detail["Time in"] ?? ""),
+        "Time out": String(detail["Time out"] ?? ""),
+        "Duration in": String(detail["Duration in"] ?? ""),
+        Location: String(loc.Location ?? ""),
+        "Last message time": String(loc["Last message time"] ?? ""),
+        "Mileage 4HRs": mileage4ByUnit.get(unitId) ?? "",
+        "Mileage in trips": String(mileage["Mileage in trips"] ?? ""),
+        "Yard Geofence": yard?.yardGeofence ?? "",
+        "Yard Time in": yard?.yardTimeIn ?? "",
+        Status: yard?.status ?? "Incomplete",
+      });
+    }
+
+    // Ensure exact column order requested
+    const columns = [
+      "Grouping",
+      "Geofence",
+      "Time in",
+      "Time out",
+      "Duration in",
+      "Location",
+      "Last message time",
+      "Mileage 4HRs",
+      "Mileage in trips",
+      "Yard Geofence",
+      "Yard Time in",
+      "Status",
+    ] as const;
+    const trackingOrdered = trackingRows.map((r) => {
+      const o: Record<string, string> = {};
+      for (const c of columns) o[c] = r[c] ?? "";
+      return o;
+    });
+
+    // Build Excel (single output table = new_df)
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(locOut), "Last Location");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(mileageFinal), "Mileage");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(geofenceOut), "Geofences");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(trackingOrdered), "Tracking");
 
     const bytes = XLSX.write(wb, { bookType: "xlsx", type: "buffer" }) as Buffer;
-    const filename = `Menengai_4HR_${start.replace(/[:]/g, "-")}_to_${end.replace(/[:]/g, "-")}.xlsx`;
+    const filename = `Menengai_4HR_${formatNowForFilenameEat()}.xlsx`;
 
-    const res = new NextResponse(bytes, {
+    return new Response(new Uint8Array(bytes), {
       status: 200,
       headers: {
         "Content-Type":
@@ -306,7 +552,6 @@ export async function POST(req: Request) {
         "X-Missing-Vehicles": missing.slice(0, 50).join(" | "),
       },
     });
-    return res;
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Unknown error" },
